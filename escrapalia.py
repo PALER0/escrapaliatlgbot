@@ -1,35 +1,36 @@
 #!/usr/bin/env python3
 """Robot de subastas de Escrapalia. Solo AVISA: nunca puja.
-
+ 
   - Avisa de lotes NUEVOS de las categorías que elijas, filtrados por provincias
     (o por radio desde Llodio, p. ej. Inmuebles).
   - Cada aviso lleva un botón ⭐ Seguir. Los lotes que sigues reciben avisos
     de cuenta atrás (24 h, 3 h, 1 h, 15 min) y salen en el resumen de la noche.
   - Comandos del bot: /favoritos, /quitar N, /resumen, /ayuda.
-
+ 
 Uso:
     python escrapalia.py            # ejecución normal (avisa y guarda estado)
     python escrapalia.py --probar   # prueba: muestra lo que lee, sin avisar ni guardar
-
+ 
 Comparte configuración (CONFIG_YAML), estado, Telegram y cálculo de distancias
 con robot.py (hay que dejarlo en la misma carpeta).
 """
-
+ 
 import hashlib
 import html
 import json
 import os
 import random
+import re
 import string
 import sys
 import time
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
-
+ 
 import requests
-
+ 
 import robot
-
+ 
 API = "https://api.escrapalia.com/api/web/batch"
 WEB = "https://www.escrapalia.com"
 HEADERS = {
@@ -49,12 +50,12 @@ RECORDATORIOS_DEFECTO = [24, 3, 1, 0.25]       # horas antes del final
 DIAS = ["lun", "mar", "mié", "jue", "vie", "sáb", "dom"]
 MADRID = ZoneInfo("Europe/Madrid")
 LIMITE_TELEGRAM = 3800
-
-
+ 
+ 
 # --------------------------------------------------------------------------
 # Lectura de la API
 # --------------------------------------------------------------------------
-
+ 
 def pedir_pagina(api, path, skip, tam):
     params = {
         "country": "España", "isFinished": "false",
@@ -70,8 +71,8 @@ def pedir_pagina(api, path, skip, tam):
         return r.json()
     except ValueError:
         raise RuntimeError("Escrapalia devolvió algo que no es JSON")
-
-
+ 
+ 
 def leer_lotes(api, path):
     """Todos los lotes activos de una categoría. Devuelve (lotes, total, truncado)."""
     lotes, vistos, skip, total = [], set(), 0, 0
@@ -88,23 +89,23 @@ def leer_lotes(api, path):
             return lotes, total, False
         time.sleep(random.uniform(0.5, 1.2))
     return lotes, total, True
-
-
+ 
+ 
 def _num(v):
     try:
         return float(v)
     except (TypeError, ValueError):
         return None
-
-
+ 
+ 
 def _fecha(txt):
     try:
         d = datetime.fromisoformat(txt)
         return d if d.tzinfo else d.replace(tzinfo=timezone.utc)
     except (TypeError, ValueError):
         return None
-
-
+ 
+ 
 def normaliza(it):
     if not it.get("id"):
         return None
@@ -131,35 +132,37 @@ def normaliza(it):
         "cat_hash": cat_hash or "",
         "activa": it.get("isAuctionActive", True),
     }
-
-
+ 
+ 
 def corto(ident):
     """Clave corta para los botones de Telegram (límite de 64 bytes)."""
     return hashlib.sha1(str(ident).encode()).hexdigest()[:12]
-
-
+ 
+ 
 # --------------------------------------------------------------------------
 # Zona: por provincias (lo normal) o por radio desde el centro (Inmuebles)
 # --------------------------------------------------------------------------
-
+ 
 def veredicto(cat, l, zona, ecfg, est, ctx, centro):
     """("ok", km|None) / ("dudoso", txt) / ("sinubicacion", txt) / ("fuera", txt).
     Lanza robot.ErrorGeo si hay que reintentar (solo en modo radio)."""
     if cat.get("radio_km"):
         z = {**zona, "radio_km": cat["radio_km"]}
-        return robot.evaluar(l, z, est, ctx, centro)
+        # "Piélagos (Somacueva, Liencres)" -> "Piélagos" para buscarlo en el mapa
+        ciudad = re.split(r"\s*[(/,]", l["ciudad"])[0].strip()
+        return robot.evaluar({**l, "ciudad": ciudad}, z, est, ctx, centro)
     provs = cat.get("provincias") or ecfg.get("provincias") or PROVINCIAS_DEFECTO
     if not l["region"]:
         return "fuera", "sin provincia"
     if robot.provincia_en(l["region"], provs):
         return "ok", None
     return "fuera", f"provincia {l['region']}"
-
-
+ 
+ 
 # --------------------------------------------------------------------------
 # Telegram (con botones y lectura de pulsaciones)
 # --------------------------------------------------------------------------
-
+ 
 def tg(metodo, **datos):
     token = os.environ.get("TELEGRAM_TOKEN")
     if not token:
@@ -172,8 +175,8 @@ def tg(metodo, **datos):
     if r.status_code != 200:      # no se imprime la URL (lleva el token)
         raise RuntimeError(f"Telegram ({metodo}) respondió {r.status_code}: {r.text[:200]}")
     return r.json()
-
-
+ 
+ 
 def enviar(texto, botones=None, previa=True):
     chat = os.environ.get("TELEGRAM_CHAT_ID")
     if not chat:
@@ -183,8 +186,8 @@ def enviar(texto, botones=None, previa=True):
     if botones:
         datos["reply_markup"] = {"inline_keyboard": botones}
     tg("sendMessage", **datos)
-
-
+ 
+ 
 def enviar_largo(lineas, botones=None):
     """Envía líneas de texto partiéndolas en mensajes de tamaño permitido."""
     trozo, largo, partes = [], 0, []
@@ -198,24 +201,24 @@ def enviar_largo(lineas, botones=None):
         partes.append("\n".join(trozo))
     for i, p in enumerate(partes):
         enviar(p, botones if i == len(partes) - 1 else None, previa=False)
-
-
+ 
+ 
 def boton_lote(k, l_url, siguiendo):
     if siguiendo:
         sel = {"text": "✅ Siguiendo · quitar", "callback_data": f"u:{k}"}
     else:
         sel = {"text": "⭐ Seguir", "callback_data": f"f:{k}"}
     return [[sel, {"text": "🔗 Abrir", "url": l_url}]]
-
-
+ 
+ 
 # --------------------------------------------------------------------------
 # Textos
 # --------------------------------------------------------------------------
-
+ 
 def horas_restantes(fin, ahora):
     return (fin - ahora).total_seconds() / 3600 if fin else None
-
-
+ 
+ 
 def en_tiempo(h):
     m = max(int(h * 60), 0)
     if m < 60:
@@ -223,28 +226,28 @@ def en_tiempo(h):
     if m < 24 * 60:
         return f"{m // 60} h {m % 60:02d} min"
     return f"{m // 1440} d {(m % 1440) // 60} h"
-
-
+ 
+ 
 def fecha_es(dt):
     d = dt.astimezone(MADRID)
     return f"{DIAS[d.weekday()]} {d:%d/%m} {d:%H:%M}"
-
-
+ 
+ 
 def precio_txt(f):
     """Puja actual; si aún no hay pujas, el precio de salida."""
     if not f.get("pujas") and f.get("sig") is not None:
         return f"sale en {robot.formatea_precio(f['sig'])}"
     return robot.formatea_precio(f.get("puja"))
-
-
+ 
+ 
 def euros(p):
     return robot.formatea_precio(p)
-
-
+ 
+ 
 def txt_pujas(n):
     return "sin pujas" if not n else f"{n} {'puja' if n == 1 else 'pujas'}"
-
-
+ 
+ 
 def cuerpo(cat_nombre, l, km, dudoso, ahora):
     lugar = ", ".join(x for x in (l["ciudad"], l["region"]) if x) or "ubicación no indicada"
     if km is not None:
@@ -261,12 +264,12 @@ def cuerpo(cat_nombre, l, km, dudoso, ahora):
     fin = f"\n⏳ Termina {fecha_es(l['fin'])} (en {en_tiempo(h)})" if h is not None else ""
     return (f"<b>[Escrapalia · {html.escape(cat_nombre)}]</b> {html.escape(l['titulo'])}\n"
             f"💶 {puja}\n📍 {html.escape(lugar)}{fin}\n{html.escape(l['url'])}")
-
-
+ 
+ 
 def enlace(f):
     return f'<a href="{html.escape(f["url"])}">{html.escape(f["titulo"])}</a>'
-
-
+ 
+ 
 def linea_lote(f, ahora, i=None):
     """Línea de resumen de un lote guardado (favorito o no)."""
     fin = _fecha(f.get("fin"))
@@ -282,12 +285,12 @@ def linea_lote(f, ahora, i=None):
     h = horas_restantes(fin, datetime.now(timezone.utc))
     cuando = (f" · ⏳ {fecha_es(fin)} (en {en_tiempo(h)})" if h is not None else "")
     return f"{pre}{enlace(f)}\n   💶 {precio}{cambio} · {txt_pujas(f.get('pujas'))}{cuando}"
-
-
+ 
+ 
 def clave_fin(f):
     return _fecha(f.get("fin")) or datetime.max.replace(tzinfo=timezone.utc)
-
-
+ 
+ 
 def texto_favoritos(est):
     favs = sorted(est["esc"]["fav"].items(), key=lambda kv: clave_fin(kv[1]))
     if not favs:
@@ -304,15 +307,15 @@ def texto_favoritos(est):
         botones.append(fila)
     lineas.append("\n<i>Pulsa ❌ con el número para dejar de seguir un lote.</i>")
     return lineas, botones
-
-
+ 
+ 
 def texto_resumen(est, ahora):
     """Resumen de la noche: favoritos, finalizados hoy, lotes de mañana y avisos de hoy."""
     e = est["esc"]
     hoy = ahora.astimezone(MADRID).date()
     manana = hoy + timedelta(days=1)
     lineas = [f"🌙 <b>Resumen de subastas · {DIAS[hoy.weekday()]} {hoy:%d/%m}</b>"]
-
+ 
     favs = sorted(e["fav"].items(), key=lambda kv: clave_fin(kv[1]))
     activos = [f for _, f in favs if f.get("estado") != "terminado"]
     terminados = [f for _, f in favs if f.get("estado") == "terminado"]
@@ -326,7 +329,7 @@ def texto_resumen(est, ahora):
         lineas.append("\n<b>🏁 Favoritos terminados</b>")
         for f in terminados:
             lineas.append(linea_lote(f, ahora))
-
+ 
     sig = [(k, f) for k, f in e["lotes"].items()
            if k not in e["fav"] and _fecha(f.get("fin"))
            and _fecha(f["fin"]).astimezone(MADRID).date() == manana
@@ -347,19 +350,19 @@ def texto_resumen(est, ahora):
             resumen_botones.append(fila)
         if len(sig) > 10:
             lineas.append(f"… y {len(sig) - 10} más.")
-
+ 
     hoy_s = hoy.isoformat()
     n = (e.get("hoy") or {}).get("n", {}) if (e.get("hoy") or {}).get("fecha") == hoy_s else {}
     if n:
         lineas.append(f"\n<b>🆕 Avisos de hoy: {sum(n.values())}</b> · "
                       + ", ".join(f"{html.escape(c)}: {v}" for c, v in sorted(n.items())))
     return lineas, resumen_botones or None
-
-
+ 
+ 
 # --------------------------------------------------------------------------
 # Estado propio de Escrapalia (dentro del mismo state/vistos.json)
 # --------------------------------------------------------------------------
-
+ 
 def estado_esc(est):
     e = est.setdefault("esc", {})
     e.setdefault("offset", 0)       # siguiente update de Telegram a leer
@@ -370,8 +373,8 @@ def estado_esc(est):
     e.setdefault("silencio", 0)     # hora (epoch) hasta la que no avisa de lotes nuevos
     e.setdefault("resumen", "")     # fecha del último resumen enviado
     return e
-
-
+ 
+ 
 def instantanea(cat_nombre, l, km, dudoso):
     return {
         "id": l["id"], "titulo": l["titulo"], "url": l["url"],
@@ -380,15 +383,15 @@ def instantanea(cat_nombre, l, km, dudoso):
         "km": km, "dudoso": dudoso, "vt": time.time(),
         "lugar": ", ".join(x for x in (l["ciudad"], l["region"]) if x),
     }
-
-
+ 
+ 
 def refrescar(f, l):
     f["puja"], f["pujas"], f["sig"] = l["puja"], l["pujas"], l["siguiente"]
     if l["fin"]:
         f["fin"] = l["fin"].isoformat()
     f["vt"] = time.time()
-
-
+ 
+ 
 def podar(est, ahora):
     e = est["esc"]
     limite = time.time() - 3 * 86400
@@ -399,12 +402,12 @@ def podar(est, ahora):
               if f.get("estado") == "terminado"
               and (_fecha(f.get("fin")) or ahora) < ahora - timedelta(days=3)]:
         del e["fav"][k]
-
-
+ 
+ 
 # --------------------------------------------------------------------------
 # Pulsaciones y comandos de Telegram
 # --------------------------------------------------------------------------
-
+ 
 AYUDA = ("<b>Robot de subastas</b>\n"
          "⭐ en un aviso: seguir ese lote (la confirmación puede tardar unos 10 min).\n\n"
          "/favoritos · lotes que sigues (con ❌ para quitarlos)\n"
@@ -419,8 +422,8 @@ AYUDA = ("<b>Robot de subastas</b>\n"
          "/resumen · resumen de ahora mismo\n\n"
          "Los favoritos avisan a 24 h, 3 h, 1 h y 15 min del final y salen en el "
          "resumen de la noche; eso no se silencia.")
-
-
+ 
+ 
 def cambiar_boton(msg, k, url, siguiendo):
     if not msg.get("message_id") or (msg.get("text") or "").startswith(("⭐ Lotes", "🌙", "📋")):
         return
@@ -429,8 +432,8 @@ def cambiar_boton(msg, k, url, siguiendo):
            reply_markup={"inline_keyboard": boton_lote(k, url, siguiendo)})
     except Exception as ex:  # noqa: BLE001
         robot.log("No he podido cambiar el botón:", ex)
-
-
+ 
+ 
 def seguir(est, k, ahora):
     e = est["esc"]
     lot = e["lotes"].get(k)
@@ -444,15 +447,15 @@ def seguir(est, k, ahora):
     enviar(f"⭐ <b>Siguiendo:</b> {html.escape(f['titulo'])}\n"
            f"💶 {precio_txt(f)} · {txt_pujas(f.get('pujas'))}", previa=False)
     return f
-
-
+ 
+ 
 def dejar(est, k):
     f = est["esc"]["fav"].pop(k, None)
     if f:
         enviar(f"❌ <b>Dejas de seguir:</b> {html.escape(f['titulo'])}", previa=False)
     return f
-
-
+ 
+ 
 def listado(titulo, items, maximo=12):
     """Mensaje numerado con botones ⭐ para seguir cada lote. items = [(k, lote)]."""
     if not items:
@@ -474,15 +477,15 @@ def listado(titulo, items, maximo=12):
     if len(items) > maximo:
         lineas.append(f"… y {len(items) - maximo} más.")
     return lineas, botones
-
-
+ 
+ 
 def lotes_activos(est, ahora, solo_no_fav=True):
     e = est["esc"]
     return [(k, f) for k, f in e["lotes"].items()
             if (not solo_no_fav or k not in e["fav"])
             and _fecha(f.get("fin")) and _fecha(f["fin"]) > ahora]
-
-
+ 
+ 
 def duracion(txt):
     """'8h', '90m', '2d' -> segundos; None si no se entiende."""
     txt = (txt or "").strip().lower()
@@ -491,16 +494,16 @@ def duracion(txt):
     except ValueError:
         return None
     return n * {"m": 60, "h": 3600, "d": 86400}.get(txt[-1:], 0) or None
-
-
+ 
+ 
 def coincide_palabra(est, titulo):
     t = robot.sin_acentos(titulo)
     for w in est["esc"]["palabras"]:
         if robot.sin_acentos(w) in t:
             return w
     return None
-
-
+ 
+ 
 def texto_stats(est, ahora):
     e = est["esc"]
     act = lotes_activos(est, ahora, solo_no_fav=False)
@@ -522,8 +525,8 @@ def texto_stats(est, ahora):
             lineas.append(f"Subida media de la puja desde que los marcaste: "
                           f"{euros(sum(sub) / len(sub))}")
     return lineas
-
-
+ 
+ 
 def procesar_telegram(est, ahora):
     """Lee lo que has pulsado/escrito desde la última vez y lo aplica."""
     e = est["esc"]
@@ -628,12 +631,12 @@ def procesar_telegram(est, ahora):
         elif cmd == "/resumen":
             lineas, botones = texto_resumen(est, ahora)
             enviar_largo(lineas, botones)
-
-
+ 
+ 
 # --------------------------------------------------------------------------
 # Seguimiento de favoritos
 # --------------------------------------------------------------------------
-
+ 
 def seguir_favoritos(est, actual, ahora, umbrales):
     """Actualiza los favoritos y avisa de cuenta atrás y de lotes terminados."""
     e = est["esc"]
@@ -665,12 +668,12 @@ def seguir_favoritos(est, actual, ahora, umbrales):
             enviar(f"⏰ <b>⭐ Termina en {en_tiempo(h)}</b>\n{enlace(f)}\n"
                    f"💶 {precio_txt(f)}{cambio} · {txt_pujas(f.get('pujas'))}\n"
                    f"⏳ {fecha_es(fin)}", previa=False)
-
-
+ 
+ 
 # --------------------------------------------------------------------------
 # Programa principal
 # --------------------------------------------------------------------------
-
+ 
 def main():
     probar = "--probar" in sys.argv
     cfg = robot.cargar_config()
@@ -682,7 +685,7 @@ def main():
     if not cats:
         robot.log("Escrapalia: faltan las 'categorias' con su 'path'.")
         return
-
+ 
     zona = cfg.get("zona", {})
     centro = (zona.get("latitud", robot.LAT_DEFECTO), zona.get("longitud", robot.LON_DEFECTO))
     horas_fin = ecfg.get("termina_pronto_horas", 0) or 0
@@ -692,17 +695,17 @@ def main():
     hora_resumen = (cfg.get("resumen") or {}).get("hora", 21)
     dudosos_ok = zona.get("avisar_ubicacion_dudosa", True)
     sin_ubic_ok = zona.get("avisar_sin_ubicacion", False)
-
+ 
     est = robot.cargar_estado()
     e = estado_esc(est)
     vistos = est["vistos"].setdefault("escrapalia", {})
     ctx = {"consultas": 0, "errores": 0}
     ahora = datetime.now(timezone.utc)
-
+ 
     def decide(v):   # ¿se avisa con este veredicto?
         return not (v == "fuera" or (v == "dudoso" and not dudosos_ok)
                     or (v == "sinubicacion" and not sin_ubic_ok))
-
+ 
     # ---- 1) Leer todas las categorías
     leidas, actual, fallos, leidas_crudas = [], {}, [], {}
     for cat in cats:
@@ -738,7 +741,7 @@ def main():
                     and (l["fin"] is None or l["fin"] > ahora)):
                 lotes.append(l)
         leidas.append((cat, lotes, total))
-
+ 
     # ---- Modo prueba: solo informa
     if probar:
         for cat, lotes, total in leidas:
@@ -786,14 +789,14 @@ def main():
                   f"({ctx['consultas']} consultas al mapa). Favoritos y botones no se "
                   "prueban aquí: se ven en Telegram.")
         return
-
+ 
     # ---- 2) Pulsaciones y comandos de Telegram
     try:
         procesar_telegram(est, ahora)
     except Exception as ex:  # noqa: BLE001
         robot.log("Error enviando a Telegram:", ex)
         sys.exit(1)
-
+ 
     # ---- 3) Lotes nuevos / terminan pronto
     avisos = []            # {"txt", "botones", "deshacer"}
     inicializadas, n_dentro, n_marcados = [], {}, 0
@@ -836,7 +839,7 @@ def main():
             siguiendo = k in e["fav"]
             h = horas_restantes(l["fin"], ahora)
             botones = boton_lote(k, l["url"], siguiendo)
-
+ 
             if nuevo and not primera and avisar_nuevos:
                 w = coincide_palabra(est, l["titulo"])
                 avisos.append({
@@ -859,12 +862,12 @@ def main():
             est["listos"].append(clave)
             inicializadas.append(nombre)
         robot.log(f"[{nombre}] {len(lotes)} lotes activos, {dentro} en tu zona")
-
+ 
     if ctx["errores"] >= robot.MAX_ERRORES_GEO:
         robot.alertar(est, "geo", "No consigo consultar el mapa (Nominatim) para calcular "
                       "distancias. Los lotes afectados se reintentarán en la próxima revisión.",
                       horas=12)
-
+ 
     # ---- 4) Enviar avisos, favoritos, resumen
     try:
         if inicializadas:
@@ -900,12 +903,13 @@ def main():
         # Si Telegram falla no se guarda el estado: así se reintentará
         robot.log("Error enviando a Telegram:", ex)
         sys.exit(1)
-
+ 
     podar(est, ahora)
     robot.guardar_estado(est)
     robot.log(f"Hecho. Avisos de Escrapalia: {len(enviados)} "
               f"({ctx['consultas']} consultas al mapa, {len(e['fav'])} favoritos)")
-
-
+ 
+ 
 if __name__ == "__main__":
     main()
+ 
